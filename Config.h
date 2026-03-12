@@ -4,22 +4,20 @@
 #include <stddef.h>
 
 // ===== Serial to Arduino UNO =====
-static constexpr uint32_t SERIAL_BAUD = 57600;
+static constexpr uint32_t SERIAL_BAUD = 19200;
 
 // ===== Boot/Power-on robustness =====
-// Ignore serial bytes during ESP8266 boot spew / UNO reset settling
-static constexpr uint32_t BOOT_QUIET_TIME_MS = 1200;
+static constexpr uint32_t BOOT_QUIET_TIME_MS = 80;
+static constexpr uint32_t BOOT_FLUSH_TIME_MS = 50;
 
-// After quiet time, flush any remaining bytes
-static constexpr uint32_t BOOT_FLUSH_TIME_MS = 200;
-
-// If we get garbage / desync, we enter resync mode and discard until OP_BEGIN arrives
-static constexpr uint32_t RESYNC_TIMEOUT_MS = 3000;
+// ===== Parser recovery =====
+static constexpr uint32_t SERIAL_RECOVERY_QUIET_MS = 12;
+static constexpr uint32_t SERIAL_RECOVERY_MAX_MS   = 120;
 
 // ===== WiFi =====
 static constexpr const char* WIFI_SSID = "umd-iot";
-static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
-static constexpr uint32_t WIFI_RETRY_BACKOFF_MS   = 1500;
+static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
+static constexpr uint32_t WIFI_RETRY_BACKOFF_MS   = 3000;
 
 // ===== WebSocket =====
 static constexpr uint16_t WS_PORT = 7755;
@@ -38,6 +36,10 @@ static constexpr size_t ROOM_IP_MAP_LEN = sizeof(ROOM_IP_MAP) / sizeof(ROOM_IP_M
 // ===== Reconnect =====
 static constexpr uint32_t WS_RECONNECT_INTERVAL_MS = 1500;
 
+// Keep routing pinned to the requested room.
+// Set true only if your default IP is a known good generic gateway.
+static constexpr bool WS_ALLOW_DEFAULT_FALLBACK = false;
+
 // ===== Buffered outbox =====
 static constexpr uint8_t WS_OUTBOX_MAX = 10;
 
@@ -49,7 +51,7 @@ static constexpr uint8_t  PING_MISS_LIMIT = 5;
 static constexpr uint32_t POSE_REQUEST_PERIOD_MS = 250;
 
 // ===== Serial protocol =====
-static constexpr uint32_t SERIAL_READ_TIMEOUT_MS = 200;
+static constexpr uint32_t SERIAL_READ_TIMEOUT_MS = 250;
 static constexpr uint8_t  FLUSH_SEQ[4] = {0xFF, 0xFE, 0xFD, 0xFC};
 
 // ===== Debug (optional) =====

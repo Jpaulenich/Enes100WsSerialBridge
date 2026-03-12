@@ -12,9 +12,14 @@ public:
   void loop();
 
   uint16_t currentRoom() const { return m_room; }
+  void setRouteDebug(uint8_t routeIndex, uint8_t routeCount, bool routeIsFallback);
+  void setWifiDebug(uint8_t lastDisconnectReason,
+                    uint16_t wifiBeginCount,
+                    uint16_t wifiGotIpCount,
+                    bool wifiJoinInProgress,
+                    uint8_t wifiJoinAgeSec);
 
 private:
-  // VisionSystemClient opcodes (kept)
   static constexpr uint8_t OP_BEGIN        = 0x01;
   static constexpr uint8_t OP_PRINT        = 0x02;
   static constexpr uint8_t OP_CHECK        = 0x03;
@@ -22,6 +27,7 @@ private:
   static constexpr uint8_t OP_ML_PRED      = 0x05;
   static constexpr uint8_t OP_ML_CAPTURE   = 0x06;
   static constexpr uint8_t OP_IS_CONNECTED = 0x07;
+  static constexpr uint8_t OP_DEBUG_STATUS = 0x08;
 
   bool readByte(uint8_t& out, uint32_t timeoutMs);
   bool readBytes(uint8_t* out, size_t n, uint32_t timeoutMs);
@@ -36,28 +42,25 @@ private:
   void handleIsConnected();
   void handleMlPrediction();
   void handleMlCapture();
+  void handleDebugStatus();
 
-  // WS handlers
   void onWsText(const String& s);
   void onWsConnected();
   void parseArucoUpdate(const String& s);
   void parsePingUpdate(const String& s);
 
-  // Manual ping + pose loops
   void pingLoop();
   void sendPing(const char* status);
   void poseRequestLoop();
   void requestArucoOnce();
 
-  // Begin resend
   void sendBeginPacket();
 
-  // Helpers
   String jsonEscape(const String& s) const;
   void sendCheckResponse(bool hasNew);
   void encodeAndSendLocation();
+  void discardInputUntilIdle(uint32_t quietMs, uint32_t maxMs);
 
-  // Boot flush only (fixed so it DOESN'T discard a real opcode)
   void bootFlushLoop();
   bool isValidOpcode(uint8_t b) const;
 
@@ -77,21 +80,26 @@ private:
   uint32_t m_arucoSeq = 0;
   uint32_t m_lastCheckSeqSent = 0;
 
-  // Ping bookkeeping
   uint32_t m_lastPingMs = 0;
   uint8_t  m_missedPongs = 0;
 
-  // Pose request bookkeeping
   uint32_t m_lastPoseReqMs = 0;
 
-  // Begin known?
   bool m_hasBegin = false;
 
-  // Boot flush state
   bool m_bootFlushed = false;
   uint32_t m_bootStartMs = 0;
 
-  // If we see a valid opcode during boot flush, stash it and process immediately.
   bool m_pendingOpValid = false;
   uint8_t m_pendingOp = 0;
+
+  uint8_t m_routeIndex = 0;
+  uint8_t m_routeCount = 0;
+  bool m_routeIsFallback = false;
+
+  uint8_t m_lastDisconnectReason = 0;
+  uint16_t m_wifiBeginCount = 0;
+  uint16_t m_wifiGotIpCount = 0;
+  bool m_wifiJoinInProgress = false;
+  uint8_t m_wifiJoinAgeSec = 0;
 };

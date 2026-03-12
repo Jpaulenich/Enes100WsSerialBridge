@@ -1,6 +1,7 @@
 // Enes100WifiModule.cpp
 #include "Enes100WifiModule.h"
 #include "Config.h"
+#include <ESP8266WiFi.h>
 #include <math.h>
 
 extern "C" {
@@ -37,6 +38,24 @@ void Enes100WifiModule::begin() {
   m_pendingOp = 0;
 }
 
+void Enes100WifiModule::setRouteDebug(uint8_t routeIndex, uint8_t routeCount, bool routeIsFallback) {
+  m_routeIndex = routeIndex;
+  m_routeCount = routeCount;
+  m_routeIsFallback = routeIsFallback;
+}
+
+void Enes100WifiModule::setWifiDebug(uint8_t lastDisconnectReason,
+                                     uint16_t wifiBeginCount,
+                                     uint16_t wifiGotIpCount,
+                                     bool wifiJoinInProgress,
+                                     uint8_t wifiJoinAgeSec) {
+  m_lastDisconnectReason = lastDisconnectReason;
+  m_wifiBeginCount = wifiBeginCount;
+  m_wifiGotIpCount = wifiGotIpCount;
+  m_wifiJoinInProgress = wifiJoinInProgress;
+  m_wifiJoinAgeSec = wifiJoinAgeSec;
+}
+
 bool Enes100WifiModule::isValidOpcode(uint8_t b) const {
   switch (b) {
     case OP_BEGIN:
@@ -46,39 +65,41 @@ bool Enes100WifiModule::isValidOpcode(uint8_t b) const {
     case OP_ML_PRED:
     case OP_ML_CAPTURE:
     case OP_IS_CONNECTED:
+    case OP_DEBUG_STATUS:
       return true;
     default:
       return false;
   }
 }
 
-// Fixed power-on behavior:
-// - drain junk bytes, BUT if we see a valid opcode (especially OP_BEGIN),
-//   stop flushing immediately and process it.
+void Enes100WifiModule::discardInputUntilIdle(uint32_t quietMs, uint32_t maxMs) {
+  const uint32_t start = millis();
+  uint32_t lastRx = millis();
+
+  while ((millis() - start) < maxMs) {
+    bool consumed = false;
+    while (Serial.available() > 0) {
+      Serial.read();
+      consumed = true;
+      lastRx = millis();
+      yield();
+    }
+
+    if (!consumed && (millis() - lastRx) >= quietMs) {
+      return;
+    }
+
+    yield();
+  }
+}
+
 void Enes100WifiModule::bootFlushLoop() {
   if (m_bootFlushed) return;
 
   const uint32_t now = millis();
   const uint32_t elapsed = now - m_bootStartMs;
+  const uint32_t windowMs = BOOT_QUIET_TIME_MS + BOOT_FLUSH_TIME_MS;
 
-  // Keep these short; we now rely on "valid opcode detection" instead of long drains.
-  const uint32_t quietMs =
-  #ifdef BOOT_QUIET_TIME_MS
-    BOOT_QUIET_TIME_MS;
-  #else
-    120;   // was 800; that was long enough to eat the UNO's BEGIN
-  #endif
-
-  const uint32_t flushMs =
-  #ifdef BOOT_FLUSH_TIME_MS
-    BOOT_FLUSH_TIME_MS;
-  #else
-    120;   // was 200
-  #endif
-
-  const uint32_t windowMs = quietMs + flushMs;
-
-  // During the window: read bytes. If we see a real opcode, capture and exit.
   if (elapsed < windowMs) {
     while (Serial.available() > 0) {
       int c = Serial.read();
@@ -91,12 +112,10 @@ void Enes100WifiModule::bootFlushLoop() {
         m_bootFlushed = true;
         return;
       }
-      // else: discard junk
     }
     return;
   }
 
-  // After window: stop flushing. If a valid opcode shows up now, we’ll process normally.
   m_bootFlushed = true;
 }
 
@@ -153,6 +172,83 @@ void Enes100WifiModule::handleIsConnected() {
   Serial.write(m_ws.isConnected() ? (uint8_t)0x01 : (uint8_t)0x00);
 }
 
+void Enes100WifiModule::handleDebugStatus() {
+  const WsBridge::DebugInfo dbg = m_ws.debugInfo();
+  const IPAddress ip = WiFi.localIP();
+
+  uint8_t flags = 0;
+  if (WiFi.isConnected())      flags |= 0x01;
+  if (dbg.started)             flags |= 0x02;
+  if (dbg.connected)           flags |= 0x04;
+  if (m_hasBegin)              flags |= 0x08;
+  if (dbg.everConnected)       flags |= 0x10;
+  if (dbg.lastConnectCallOk)   flags |= 0x20;
+  if (m_routeIsFallback)       flags |= 0x40;
+  if (m_wifiJoinInProgress)    flags |= 0x80;
+
+  int rssi = WiFi.isConnected() ? WiFi.RSSI() : 0;
+  if (rssi < -128) rssi = -128;
+  if (rssi > 127) rssi = 127;
+
+  String url = dbg.currentUrl;
+  if (url.length() > 63) {
+    url = url.substring(0, 63);
+  }
+
+  // Packet v2:
+  // [0]  0xA5
+  // [1]  0x02
+  // [2]  flags
+  // [3]  WiFi.status()
+  // [4]  room hi
+  // [5]  room lo
+  // [6]  routeIndex
+  // [7]  routeCount
+  // [8]  connectAttempts lo
+  // [9]  connectAttempts hi
+  // [10] openEvents
+  // [11] closeEvents
+  // [12] lastEvent
+  // [13] rssi (signed byte)
+  // [14..17] local IP
+  // [18] lastDisconnectReason
+  // [19] wifiBeginCount lo
+  // [20] wifiBeginCount hi
+  // [21] wifiGotIpCount lo
+  // [22] wifiGotIpCount hi
+  // [23] wifiJoinAgeSec
+  // [24] urlLen
+  // [25..] url bytes
+  Serial.write((uint8_t)0xA5);
+  Serial.write((uint8_t)0x02);
+  Serial.write(flags);
+  Serial.write((uint8_t)WiFi.status());
+  Serial.write((uint8_t)(m_room >> 8));
+  Serial.write((uint8_t)(m_room & 0xFF));
+  Serial.write(m_routeIndex);
+  Serial.write(m_routeCount);
+  Serial.write((uint8_t)(dbg.connectAttempts & 0xFF));
+  Serial.write((uint8_t)((dbg.connectAttempts >> 8) & 0xFF));
+  Serial.write(dbg.openEvents);
+  Serial.write(dbg.closeEvents);
+  Serial.write(dbg.lastEvent);
+  Serial.write((uint8_t)((int8_t)rssi));
+  Serial.write(ip[0]);
+  Serial.write(ip[1]);
+  Serial.write(ip[2]);
+  Serial.write(ip[3]);
+  Serial.write(m_lastDisconnectReason);
+  Serial.write((uint8_t)(m_wifiBeginCount & 0xFF));
+  Serial.write((uint8_t)((m_wifiBeginCount >> 8) & 0xFF));
+  Serial.write((uint8_t)(m_wifiGotIpCount & 0xFF));
+  Serial.write((uint8_t)((m_wifiGotIpCount >> 8) & 0xFF));
+  Serial.write(m_wifiJoinAgeSec);
+  Serial.write((uint8_t)url.length());
+  if (url.length() > 0) {
+    Serial.write((const uint8_t*)url.c_str(), url.length());
+  }
+}
+
 void Enes100WifiModule::sendBeginPacket() {
   if (m_teamName.length() == 0) return;
 
@@ -183,27 +279,36 @@ void Enes100WifiModule::handleBegin() {
   uint8_t teamType;
   uint8_t fixed[4];
 
-  if (!readByte(teamType, SERIAL_READ_TIMEOUT_MS)) return;
-  if (!readBytes(fixed, 4, SERIAL_READ_TIMEOUT_MS)) return;
+  if (!readByte(teamType, SERIAL_READ_TIMEOUT_MS)) {
+    discardInputUntilIdle(SERIAL_RECOVERY_QUIET_MS, SERIAL_RECOVERY_MAX_MS);
+    return;
+  }
+  if (!readBytes(fixed, 4, SERIAL_READ_TIMEOUT_MS)) {
+    discardInputUntilIdle(SERIAL_RECOVERY_QUIET_MS, SERIAL_RECOVERY_MAX_MS);
+    return;
+  }
+
+  String team;
+  if (!readUntilNull(team, SERIAL_READ_TIMEOUT_MS)) {
+    discardInputUntilIdle(SERIAL_RECOVERY_QUIET_MS, SERIAL_RECOVERY_MAX_MS);
+    return;
+  }
+  if (!readFlush(SERIAL_READ_TIMEOUT_MS)) {
+    discardInputUntilIdle(SERIAL_RECOVERY_QUIET_MS, SERIAL_RECOVERY_MAX_MS);
+    return;
+  }
 
   m_teamType = teamType;
   m_markerId = (uint16_t)((fixed[0] << 8) | fixed[1]);
   m_room     = (uint16_t)((fixed[2] << 8) | fixed[3]);
-
-  String team;
-  if (!readUntilNull(team, SERIAL_READ_TIMEOUT_MS)) return;
-  if (!readFlush(SERIAL_READ_TIMEOUT_MS)) return;
-
   m_teamName = team;
   m_hasBegin = true;
 
-  // Reset state
   m_visible = false;
   m_x = m_y = m_theta = -1.0f;
   m_arucoSeq = 0;
   m_lastCheckSeqSent = 0;
 
-  // Reset timers
   m_lastPingMs = millis();
   m_missedPongs = 0;
   m_lastPoseReqMs = 0;
@@ -214,8 +319,14 @@ void Enes100WifiModule::handleBegin() {
 
 void Enes100WifiModule::handlePrint() {
   String msg;
-  if (!readUntilNull(msg, SERIAL_READ_TIMEOUT_MS)) return;
-  if (!readFlush(SERIAL_READ_TIMEOUT_MS)) return;
+  if (!readUntilNull(msg, SERIAL_READ_TIMEOUT_MS)) {
+    discardInputUntilIdle(SERIAL_RECOVERY_QUIET_MS, SERIAL_RECOVERY_MAX_MS);
+    return;
+  }
+  if (!readFlush(SERIAL_READ_TIMEOUT_MS)) {
+    discardInputUntilIdle(SERIAL_RECOVERY_QUIET_MS, SERIAL_RECOVERY_MAX_MS);
+    return;
+  }
 
   String pkt = "{";
   pkt += "\"op\":\"print\",";
@@ -228,11 +339,20 @@ void Enes100WifiModule::handlePrint() {
 
 void Enes100WifiModule::handleMission() {
   uint8_t type;
-  if (!readByte(type, SERIAL_READ_TIMEOUT_MS)) return;
+  if (!readByte(type, SERIAL_READ_TIMEOUT_MS)) {
+    discardInputUntilIdle(SERIAL_RECOVERY_QUIET_MS, SERIAL_RECOVERY_MAX_MS);
+    return;
+  }
 
   String msg;
-  if (!readUntilNull(msg, SERIAL_READ_TIMEOUT_MS)) return;
-  if (!readFlush(SERIAL_READ_TIMEOUT_MS)) return;
+  if (!readUntilNull(msg, SERIAL_READ_TIMEOUT_MS)) {
+    discardInputUntilIdle(SERIAL_RECOVERY_QUIET_MS, SERIAL_RECOVERY_MAX_MS);
+    return;
+  }
+  if (!readFlush(SERIAL_READ_TIMEOUT_MS)) {
+    discardInputUntilIdle(SERIAL_RECOVERY_QUIET_MS, SERIAL_RECOVERY_MAX_MS);
+    return;
+  }
 
   char line[192];
   mission_team_t team = (mission_team_t)m_teamType;
@@ -317,23 +437,36 @@ void Enes100WifiModule::handleCheck() {
 
 void Enes100WifiModule::handleMlPrediction() {
   uint8_t modelIndex;
-  if (!readByte(modelIndex, SERIAL_READ_TIMEOUT_MS)) return;
+  if (!readByte(modelIndex, SERIAL_READ_TIMEOUT_MS)) {
+    discardInputUntilIdle(SERIAL_RECOVERY_QUIET_MS, SERIAL_RECOVERY_MAX_MS);
+    return;
+  }
   (void)modelIndex;
-  if (!readFlush(SERIAL_READ_TIMEOUT_MS)) return;
+  if (!readFlush(SERIAL_READ_TIMEOUT_MS)) {
+    discardInputUntilIdle(SERIAL_RECOVERY_QUIET_MS, SERIAL_RECOVERY_MAX_MS);
+    return;
+  }
   Serial.write((uint8_t)0xFF);
   Serial.write((uint8_t)0xFF);
 }
 
 void Enes100WifiModule::handleMlCapture() {
   String label;
-  if (!readUntilNull(label, SERIAL_READ_TIMEOUT_MS)) return;
-  if (!readFlush(SERIAL_READ_TIMEOUT_MS)) return;
+  if (!readUntilNull(label, SERIAL_READ_TIMEOUT_MS)) {
+    discardInputUntilIdle(SERIAL_RECOVERY_QUIET_MS, SERIAL_RECOVERY_MAX_MS);
+    return;
+  }
+  if (!readFlush(SERIAL_READ_TIMEOUT_MS)) {
+    discardInputUntilIdle(SERIAL_RECOVERY_QUIET_MS, SERIAL_RECOVERY_MAX_MS);
+    return;
+  }
 
   String pkt = "{";
   pkt += "\"op\":\"ml_capture\",";
   pkt += "\"teamName\":\"" + jsonEscape(m_teamName) + "\",";
   pkt += "\"label\":\"" + jsonEscape(label) + "\"";
   pkt += "}";
+
   m_ws.sendText(pkt);
 }
 
@@ -346,11 +479,11 @@ void Enes100WifiModule::handleOpcode(uint8_t op) {
     case OP_CHECK:        handleCheck(); break;
     case OP_ML_PRED:      handleMlPrediction(); break;
     case OP_ML_CAPTURE:   handleMlCapture(); break;
+    case OP_DEBUG_STATUS: handleDebugStatus(); break;
     default: break;
   }
 }
 
-// ---- Manual ping logic ----
 void Enes100WifiModule::sendPing(const char* status) {
   if (!m_hasBegin) return;
   if (m_teamName.length() == 0) return;
@@ -381,7 +514,6 @@ void Enes100WifiModule::pingLoop() {
   }
 }
 
-// ---- WS parse ----
 void Enes100WifiModule::onWsText(const String& s) {
   parseArucoUpdate(s);
   parsePingUpdate(s);
@@ -463,26 +595,21 @@ void Enes100WifiModule::loop() {
   bootFlushLoop();
   if (!m_bootFlushed) return;
 
-  // If we captured an opcode during boot flush, process it first.
   if (m_pendingOpValid) {
     uint8_t op = m_pendingOp;
     m_pendingOpValid = false;
     handleOpcode(op);
-    // fall through to normal loop after
   }
 
-  // Background tasks
   pingLoop();
   poseRequestLoop();
 
-  // Consume opcodes
   while (Serial.available() > 0) {
     int c = Serial.read();
     if (c < 0) break;
 
     uint8_t b = (uint8_t)c;
     if (!isValidOpcode(b)) {
-      // Ignore junk bytes at runtime too (safe)
       continue;
     }
 

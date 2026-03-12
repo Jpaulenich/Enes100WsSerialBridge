@@ -7,23 +7,54 @@ using namespace websockets;
 
 WsBridge::WsBridge() {}
 
-void WsBridge::begin(const char* url) {
-  m_url = String(url);
+void WsBridge::installHandlersIfNeeded() {
+  if (m_handlersInstalled) return;
 
-  // Install handlers once. (Safe to call begin() again; this overwrites lambdas.)
   m_client.onMessage([this](WebsocketsMessage message) {
     if (message.isText()) {
       if (m_onText) m_onText(message.data());
     }
   });
 
-  // Kick off async connection attempts
-  m_prevConnected = false;
-  ensureConnected();
+  m_client.onEvent([this](WebsocketsEvent event, String data) {
+    (void)data;
+    switch (event) {
+      case WebsocketsEvent::ConnectionOpened:
+        m_lastEvent = 1;
+        m_openEvents++;
+        m_everConnected = true;
+        break;
+      case WebsocketsEvent::ConnectionClosed:
+        m_lastEvent = 2;
+        m_closeEvents++;
+        break;
+      case WebsocketsEvent::GotPing:
+        m_lastEvent = 3;
+        break;
+      case WebsocketsEvent::GotPong:
+        m_lastEvent = 4;
+        break;
+    }
+  });
+
+  m_handlersInstalled = true;
 }
 
-bool WsBridge::isConnected() {
-  return m_client.available();
+void WsBridge::begin(const char* url) {
+  installHandlersIfNeeded();
+
+  m_started = true;
+  m_url = (url != nullptr) ? String(url) : String("");
+  m_prevConnected = false;
+
+  if (m_url.length() > 0) {
+    ensureConnected();
+  }
+}
+
+bool WsBridge::isConnected() const {
+  if (!m_started) return false;
+  return const_cast<WebsocketsClient&>(m_client).available();
 }
 
 void WsBridge::onText(std::function<void(const String&)> cb) {
@@ -43,7 +74,6 @@ void WsBridge::clearOutbox() {
 void WsBridge::enqueue(const String& s) {
   if (WS_OUTBOX_MAX == 0) return;
 
-  // If full, drop oldest (keeps most recent traffic)
   if (m_count >= WS_OUTBOX_MAX) {
     m_tail = (uint8_t)((m_tail + 1) % WS_OUTBOX_MAX);
     m_count--;
@@ -55,26 +85,20 @@ void WsBridge::enqueue(const String& s) {
 }
 
 bool WsBridge::sendText(const String& s) {
-  // If connected, attempt immediate send.
   if (isConnected()) {
-    bool ok = m_client.send(s);
-    if (ok) return true;
-    // If send fails unexpectedly, queue it.
-    enqueue(s);
-    return false;
+    if (m_client.send(s)) return true;
   }
 
-  // Not connected: queue and return false (but message is preserved)
   enqueue(s);
   return false;
 }
 
 void WsBridge::flushOutbox() {
   if (!isConnected()) return;
+
   while (m_count > 0) {
     const String& msg = m_outbox[m_tail];
     if (!m_client.send(msg)) {
-      // Stop if send fails; keep remaining queued.
       return;
     }
     m_tail = (uint8_t)((m_tail + 1) % WS_OUTBOX_MAX);
@@ -84,24 +108,25 @@ void WsBridge::flushOutbox() {
 }
 
 void WsBridge::close() {
+  if (!m_started) return;
   m_client.close();
-  // allow a quick reconnect attempt, still respects WS_RECONNECT_INTERVAL_MS
   m_lastConnectAttemptMs = 0;
 }
 
 void WsBridge::setUrl(const char* url) {
-  String nu(url);
-  if (nu == m_url) return;
+  String nu = (url != nullptr) ? String(url) : String("");
+  if (nu == m_url && m_started) return;
 
   m_url = nu;
+  m_started = true;
 
-  // Messages meant for old server shouldn't leak to new server
   clearOutbox();
-
-  close(); // reconnect will happen in loop()
+  close();
 }
 
 void WsBridge::ensureConnected() {
+  if (!m_started) return;
+  if (m_url.length() == 0) return;
   if (!WiFi.isConnected()) return;
   if (isConnected()) return;
 
@@ -110,23 +135,41 @@ void WsBridge::ensureConnected() {
   m_lastConnectAttemptMs = now;
 
   m_client.close();
-  m_client.connect(m_url);
+  m_connectAttempts++;
+  m_lastConnectCallOk = m_client.connect(m_url);
 }
 
 void WsBridge::loop() {
-  ensureConnected();
+  if (!m_started) return;
 
-  if (isConnected()) {
+  if (WiFi.isConnected()) {
+    ensureConnected();
     m_client.poll();
+  }
 
-    // detect connect transition
+  const bool connectedNow = isConnected();
+
+  if (connectedNow) {
     if (!m_prevConnected) {
       m_prevConnected = true;
       if (m_onConnected) m_onConnected();
     }
-
     flushOutbox();
   } else {
     m_prevConnected = false;
   }
+}
+
+WsBridge::DebugInfo WsBridge::debugInfo() const {
+  DebugInfo d;
+  d.started = m_started;
+  d.connected = const_cast<WsBridge*>(this)->isConnected();
+  d.everConnected = m_everConnected;
+  d.lastConnectCallOk = m_lastConnectCallOk;
+  d.connectAttempts = m_connectAttempts;
+  d.openEvents = m_openEvents;
+  d.closeEvents = m_closeEvents;
+  d.lastEvent = m_lastEvent;
+  d.currentUrl = m_url;
+  return d;
 }
